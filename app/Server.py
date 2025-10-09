@@ -186,7 +186,8 @@ def parse_vless_url(vless_url):
             "alpn": "",
             "fp": params.get('fp', ['chrome'])[0],
             "pbk": params.get('pbk', [''])[0],
-            "sid": params.get('sid', [''])[0]
+            "sid": params.get('sid', [''])[0],
+            "spiderX": params.get('spiderX', [''])[0]  # Добавляем spiderX
         }
 
         # Обрабатываем flow
@@ -235,6 +236,9 @@ def json_to_vless_url(config):
             params['flow'] = config['flow']
         if config.get('path'):
             params['path'] = config['path']
+
+        if config.get('spiderX'):
+            params['spiderX'] = config['spiderX']
 
         # Собираем URL
         query_string = urlencode(params, doseq=True)
