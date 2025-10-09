@@ -1,0 +1,24 @@
+version: '3.4'
+
+services:
+  fastapi-sub:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - /srv/FastApiSub/log/:/app/log:rw
+      - /srv/FastApiSub/db:/app/db:rw
+      - /etc/x-ui/x-ui.db:/app/db/x-ui.db:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BASE_SUB_URL=https://yourdomain.com
+      - BASE_SUB_PORT=2096
+      - SUFFIX_SUB_URL=sub
+    networks:
+      - fastapisub
+    restart: unless-stopped
+
+
+networks:
+  fastapisub:
+    driver: bridge
