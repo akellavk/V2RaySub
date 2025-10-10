@@ -12,34 +12,26 @@ import logging
 import aiosqlite
 
 # Создаем приложение с отключенной документацией
-app = FastAPI(
-    title="Subscription Proxy",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
-)
+app = FastAPI(title="Subscription Proxy", docs_url=None, redoc_url=None, openapi_url=None)
 
 # Подключение к базе данных
 DB_DIR = Path("/app/db")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "x-ui.db"
+
+
 async def get_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         yield db
 
+
 # Настройка логирования
 LOG_PATH = "/app/log/FastAPI-Sub.log"
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 logger = logging.getLogger("FAS")
-logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_PATH),
-            logging.StreamHandler()
-        ]
-    )
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()])
 
 BASE_SUB_URL = os.getenv("BASE_SUB_URL", "https://127.0.0.1")
 BASE_SUB_PORT = os.getenv("BASE_SUB_PORT", "2096")
@@ -49,6 +41,7 @@ FULL_SUBSCRIPTION_URL = f"{BASE_SUB_URL}:{BASE_SUB_PORT}/{SUFFIX_SUB_URL}"
 GITHUB_WHITELIST_URL = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt"
 LOCAL_WHITELIST_FILE = "whitelist"
 
+
 def load_sni_from_github():
     """
     Загружает список SNI с GitHub
@@ -57,23 +50,24 @@ def load_sni_from_github():
         logger.info(f"Loading SNI from GitHub: {GITHUB_WHITELIST_URL}")
         response = requests.get(GITHUB_WHITELIST_URL, timeout=10)
         response.raise_for_status()
-        
+
         sni_list = []
         for line in response.text.split('\n'):
             line = line.strip()
             if line and not line.startswith('#'):  # Пропускаем пустые строки и комментарии
                 sni_list.append(line)
-        
+
         if not sni_list:
             raise ValueError("GitHub whitelist is empty")
-        
+
         logger.info(f"Loaded {len(sni_list)} SNI domains from GitHub")
         return sni_list
-        
+
     except Exception as e:
         logger.info(f"Error loading from GitHub: {e}")
         # Пробуем загрузить из локального файла как fallback
         return load_sni_from_local()
+
 
 def load_sni_from_local():
     """
@@ -82,23 +76,24 @@ def load_sni_from_local():
     try:
         if not os.path.exists(LOCAL_WHITELIST_FILE):
             raise FileNotFoundError(f"Local whitelist file '{LOCAL_WHITELIST_FILE}' not found")
-        
+
         with open(LOCAL_WHITELIST_FILE, 'r', encoding='utf-8') as f:
             sni_list = []
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
                     sni_list.append(line)
-            
+
             if not sni_list:
                 raise ValueError("Local whitelist file is empty")
-            
+
             logger.info(f"Loaded {len(sni_list)} SNI domains from local file")
             return sni_list
-            
+
     except Exception as e:
         logger.info(f"Error loading local whitelist: {e}")
         raise
+
 
 async def load_sni_from_db(id_sub: str):
     """
@@ -129,11 +124,15 @@ async def load_sni_from_db(id_sub: str):
         logger.info(f"Error loading SNI from database: {e}")
         raise
 
+
 def parse_vless_url(vless_url):
     """
     Парсит vless:// ссылку и возвращает конфиг в JSON формате
     """
     try:
+        logger.info(f"=== Parsing vless URL ===")
+        logger.info(f"Original URL: {vless_url}")
+
         # Убираем префикс vless://
         if vless_url.startswith('vless://'):
             url_content = vless_url[8:]
@@ -146,11 +145,19 @@ def parse_vless_url(vless_url):
         else:
             raise ValueError("Invalid vless URL format")
 
-        # Разделяем серверную часть на хост:порт и параметры
-        if '?' in server_part:
-            server_info, params_part = server_part.split('?', 1)
+        # Разделяем серверную часть на параметры и комментарий
+        if '#' in server_part:
+            # Разделяем на часть с параметрами и комментарий
+            params_part, comment = server_part.split('#', 1)
+            comment = unquote(comment)
         else:
-            server_info, params_part = server_part, ""
+            params_part, comment = server_part, ""
+
+        # Теперь разделяем серверную часть на хост:порт и параметры
+        if '?' in params_part:
+            server_info, query_part = params_part.split('?', 1)
+        else:
+            server_info, query_part = params_part, ""
 
         # Разбираем хост и порт
         if ':' in server_info:
@@ -158,37 +165,20 @@ def parse_vless_url(vless_url):
         else:
             raise ValueError("Invalid server format")
 
-        # Парсим параметры
-        params = parse_qs(params_part)
+        # Парсим параметры запроса
+        params = parse_qs(query_part)
 
-        # Извлекаем комментарий (после #)
-        if '#' in params_part:
-            params_part, comment = params_part.split('#', 1)
-            comment = unquote(comment)
-        else:
-            comment = ""
+        # Детально логируем все параметры
+        logger.info(f"All parameters found in URL:")
+        for key, values in params.items():
+            logger.info(f"  {key}: {values}")
 
         # Создаем JSON конфиг
-        config = {
-            "v": "2",
-            "ps": comment or "base-config",
-            "add": host,
-            "port": port,
-            "id": uuid_part,
-            "aid": "0",
-            "scy": "auto",
-            "net": params.get('type', ['tcp'])[0],
-            "type": "none",
-            "host": "",
-            "path": params.get('path', [''])[0],
-            "tls": params.get('security', ['tls'])[0],
-            "sni": params.get('sni', [''])[0],
-            "alpn": "",
-            "fp": params.get('fp', ['chrome'])[0],
-            "pbk": params.get('pbk', [''])[0],
-            "sid": params.get('sid', [''])[0],
-            "spiderX": params.get('spiderX', [''])[0]  # Добавляем spiderX
-        }
+        config = {"v": "2", "ps": comment or "base-config", "add": host, "port": port, "id": uuid_part, "aid": "0",
+            "scy": "auto", "net": params.get('type', ['tcp'])[0], "type": "none", "host": "",
+            "path": params.get('path', [''])[0], "tls": params.get('security', ['tls'])[0],
+            "sni": params.get('sni', [''])[0], "alpn": "", "fp": params.get('fp', ['chrome'])[0],
+            "pbk": params.get('pbk', [''])[0], "sid": params.get('sid', [''])[0], "spx": params.get('spx', [''])[0]}
 
         # Обрабатываем flow
         if 'flow' in params:
@@ -198,11 +188,41 @@ def parse_vless_url(vless_url):
         if 'encryption' in params:
             config['encryption'] = params['encryption'][0]
 
-        print(f"Parsed vless config for: {host}:{port}")
+        # Обрабатываем allowInsecure для WebSocket
+        if 'allowInsecure' in params:
+            config['allowInsecure'] = params['allowInsecure'][0]
+
+        # Обрабатываем host для WebSocket
+        if 'host' in params:
+            config['host'] = params['host'][0]
+
+        logger.info(f"Config type detection:")
+        logger.info(f"  Network type (net): {config['net']}")
+        logger.info(f"  Security (tls): {config['tls']}")
+        logger.info(f"  Has flow: {'flow' in config}")
+        logger.info(f"  Has pbk: {bool(config.get('pbk'))}")
+
+        # Определяем тип конфига
+        if config['net'] == 'ws' and config['tls'] == 'tls':
+            config['_config_type'] = 'websocket'
+            logger.info(f"  Detected: WebSocket config")
+        elif config['tls'] == 'reality' and config.get('pbk'):
+            config['_config_type'] = 'reality'
+            logger.info(f"  Detected: Reality config")
+        else:
+            config['_config_type'] = 'other'
+            logger.info(f"  Detected: Other config type")
+
+        logger.info(f"Final config keys: {list(config.keys())}")
+        logger.info(f"Comment (ps): '{comment}'")
+        logger.info(f"=== End parsing ===\n")
+
         return config
 
     except Exception as e:
-        print(f"Error parsing vless URL: {e}")
+        logger.info(f"Error parsing vless URL: {e}")
+        import traceback
+        logger.info(traceback.format_exc())
         return None
 
 
@@ -211,34 +231,33 @@ def json_to_vless_url(config):
     Конвертирует JSON конфиг обратно в vless:// ссылку
     """
     try:
+        logger.info(f"=== Converting JSON to vless URL ===")
+        logger.info(f"Config type: {config.get('_config_type', 'unknown')}")
+        logger.info(f"Config keys: {list(config.keys())}")
+
         # Базовые параметры
         uuid = config.get('id', '')
         host = config.get('add', '')
         port = config.get('port', '')
         comment = config.get('ps', '')
 
-        # Параметры запроса
-        params = {
-            'type': config.get('net', 'tcp'),
-            'encryption': config.get('encryption', 'none'),
-            'security': config.get('tls', 'tls'),
-            'fp': config.get('fp', 'chrome')
-        }
+        # Обязательные параметры
+        params = {'type': config.get('net', 'tcp'), 'encryption': config.get('encryption', 'none'),
+            'security': config.get('tls', 'tls')}
 
-        # Добавляем опциональные параметры
-        if config.get('sni'):
-            params['sni'] = config['sni']
-        if config.get('pbk'):
-            params['pbk'] = config['pbk']
-        if config.get('sid'):
-            params['sid'] = config['sid']
-        if config.get('flow'):
-            params['flow'] = config['flow']
-        if config.get('path'):
-            params['path'] = config['path']
+        # Добавляем fp только для Reality конфигов
+        if config.get('_config_type') == 'reality':
+            params['fp'] = config.get('fp', 'chrome')
 
-        if config.get('spiderX'):
-            params['spiderX'] = config['spiderX']
+        # Дополнительные параметры
+        optional_params = ['sni', 'pbk', 'sid', 'flow', 'path', 'spx', 'host', 'allowInsecure']
+        for param in optional_params:
+            value = config.get(param)
+            if value:
+                params[param] = value
+                logger.info(f"Added {param}: {value}")
+
+        logger.info(f"Final parameters: {params}")
 
         # Собираем URL
         query_string = urlencode(params, doseq=True)
@@ -248,10 +267,15 @@ def json_to_vless_url(config):
         if comment:
             vless_url += f"#{comment}"
 
+        logger.info(f"Generated URL: {vless_url}")
+        logger.info(f"=== End conversion ===\n")
+
         return vless_url
 
     except Exception as e:
-        print(f"Error converting JSON to vless URL: {e}")
+        logger.info(f"Error converting JSON to vless URL: {e}")
+        import traceback
+        logger.info(traceback.format_exc())
         return None
 
 
@@ -260,20 +284,20 @@ def get_base_configs(sub_id: str):
     Получает базовые конфиги из оригинальной подписки
     """
     try:
-        print(f"Fetching base subscription from: {FULL_SUBSCRIPTION_URL}/{sub_id}")
+        logger.info(f"Fetching base subscription from: {FULL_SUBSCRIPTION_URL}/{sub_id}")
         response = requests.get(f"{FULL_SUBSCRIPTION_URL}/{sub_id}", timeout=10)
         response.raise_for_status()
 
         original_content = response.text.strip()
-        print(f"Raw subscription response length: {len(original_content)}")
+        logger.info(f"Raw subscription response length: {len(original_content)}")
 
         # Декодируем base64
         try:
             decoded_content = base64.b64decode(original_content).decode('utf-8')
-            print(f"Decoded subscription: {decoded_content[:100]}...")  # Логируем начало
+            logger.info(f"Decoded subscription: {decoded_content}")
 
             configs = [line.strip() for line in decoded_content.split('\n') if line.strip()]
-            print(f"Found {len(configs)} config lines in subscription")
+            logger.info(f"Found {len(configs)} config lines in subscription")
 
             # Парсим каждую конфигурацию
             valid_configs = []
@@ -283,15 +307,15 @@ def get_base_configs(sub_id: str):
                     config = parse_vless_url(config_line)
                     if config:
                         valid_configs.append(config)
-                        print(f"Successfully parsed vless config")
+                        logger.info(f"Successfully parsed vless config: {config.get('_config_type')}")
                 # Если это JSON
                 else:
                     try:
                         config = json.loads(config_line)
                         valid_configs.append(config)
-                        print(f"Valid JSON config: {config.get('ps', 'Unknown')}")
+                        logger.info(f"Valid JSON config: {config.get('ps', 'Unknown')}")
                     except json.JSONDecodeError:
-                        print(f"Invalid JSON, trying as vless URL: {config_line[:50]}...")
+                        logger.info(f"Invalid JSON, trying as vless URL: {config_line[:50]}...")
                         # Пробуем распарсить как vless
                         config = parse_vless_url(config_line)
                         if config:
@@ -300,39 +324,29 @@ def get_base_configs(sub_id: str):
             return valid_configs
 
         except Exception as e:
-            print(f"Error decoding base64 subscription: {e}")
+            logger.info(f"Error decoding base64 subscription: {e}")
             return []
 
     except requests.RequestException as e:
-        print(f"Error fetching base subscription: {e}")
+        logger.info(f"Error fetching base subscription: {e}")
         return []
     except Exception as e:
-        print(f"Unexpected error in get_base_configs: {e}")
+        logger.info(f"Unexpected error in get_base_configs: {e}")
         return []
 
 
-@app.get("/sub/{id_sub}", response_class=PlainTextResponse)
-async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здесь указывается Subscribe ID из x-ui")]):
+def generate_multi_configs(base_configs, sni_list):
     """
-    Генерирует подписку с несколькими SNI на основе базовой подписки
+    Генерирует множественные конфиги для разных SNI
     """
-    try:
-        # Загружаем SNI с GitHub
-        # sni_list = load_sni_from_github()
-        sni_list = await load_sni_from_db(id_sub)
-        print(f"Processing {len(sni_list)} SNI domains")
+    multi_configs = []
 
-        # Получаем базовые конфиги
-        base_configs = get_base_configs(id_sub)
-        print(f"Processing {len(base_configs)} base configs")
+    for base_config in base_configs:
+        config_type = base_config.get('_config_type', 'unknown')
+        logger.info(f"Processing config type: {config_type}")
 
-        if not base_configs:
-            return "Error: No valid configurations found in base subscription"
-
-        multi_configs = []
-
-        # Создаем конфиг для каждого SNI и каждого базового конфига
-        for base_config in base_configs:
+        if config_type == 'reality':
+            # Для Reality: создаем конфиг для каждого SNI
             for sni in sni_list:
                 new_config = base_config.copy()
                 new_config['sni'] = sni
@@ -346,7 +360,51 @@ async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здес
                 if vless_url:
                     multi_configs.append(vless_url)
 
-        print(f"Generated {len(multi_configs)} total configs")
+        elif config_type == 'websocket':
+            # Для WebSocket: создаем конфиг для каждого SNI
+            for sni in sni_list:
+                new_config = base_config.copy()
+                new_config['sni'] = sni
+
+                # Обновляем описание
+                original_ps = base_config.get('ps', 'base-config')
+                new_config['ps'] = f"{original_ps} - sni:{sni}"
+
+                # Конвертируем обратно в vless URL
+                vless_url = json_to_vless_url(new_config)
+                if vless_url:
+                    multi_configs.append(vless_url)
+
+        else:
+            # Для других типов конфигов просто добавляем как есть
+            vless_url = json_to_vless_url(base_config)
+            if vless_url:
+                multi_configs.append(vless_url)
+
+    return multi_configs
+
+
+@app.get("/sub/{id_sub}", response_class=PlainTextResponse)
+async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здесь указывается Subscribe ID из x-ui")]):
+    """
+    Генерирует подписку с несколькими SNI на основе базовой подписки
+    """
+    try:
+        # Загружаем SNI с GitHub или из базы данных
+        # sni_list = load_sni_from_github()
+        sni_list = await load_sni_from_db(id_sub)
+        logger.info(f"Processing {len(sni_list)} SNI domains")
+
+        # Получаем базовые конфиги
+        base_configs = get_base_configs(id_sub)
+        logger.info(f"Processing {len(base_configs)} base configs")
+
+        if not base_configs:
+            return "Error: No valid configurations found in base subscription"
+
+        # Генерируем множественные конфиги
+        multi_configs = generate_multi_configs(base_configs, sni_list)
+        logger.info(f"Generated {len(multi_configs)} total configs")
 
         if not multi_configs:
             return "Error: No configurations generated"
@@ -355,13 +413,14 @@ async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здес
         combined_configs = '\n'.join(multi_configs)
         encoded_output = base64.b64encode(combined_configs.encode('utf-8')).decode('utf-8')
 
-        print(f"Successfully generated subscription with {len(multi_configs)} configs")
+        logger.info(f"Successfully generated subscription with {len(multi_configs)} configs")
         return encoded_output
 
     except Exception as e:
         error_msg = f"Error processing subscription: {str(e)}"
-        print(error_msg)
+        logger.info(error_msg)
         return error_msg
+
 
 @app.get("/debug-sni-list")
 async def debug_sni_list():
@@ -370,10 +429,7 @@ async def debug_sni_list():
     """
     try:
         sni_list = load_sni_from_github()
-        return {
-            "status": "success",
-            "sni_count": len(sni_list),
-            "sni_list": sni_list[:10]  # Показываем первые 10 SNI
+        return {"status": "success", "sni_count": len(sni_list), "sni_list": sni_list[:10]  # Показываем первые 10 SNI
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -386,15 +442,11 @@ async def reload_whitelist():
     """
     try:
         sni_list = load_sni_from_github()
-        return {
-            "status": "success",
-            "message": f"Whitelist reloaded successfully",
-            "domains_loaded": len(sni_list),
-            "source": "github"
-        }
+        return {"status": "success", "message": f"Whitelist reloaded successfully", "domains_loaded": len(sni_list),
+            "source": "github"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
-    uvicorn.run("Server:app", host="0.0.0.0", port=9898, reload=True)
+    uvicorn.run("Server:app", host="0.0.0.0", port=8000, reload=True)
