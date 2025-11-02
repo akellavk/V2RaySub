@@ -19,13 +19,6 @@ DB_DIR = Path("/app/db")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "x-ui.db"
 
-
-async def get_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON")
-        yield db
-
-
 # Настройка логирования
 LOG_PATH = "/app/log/FastAPI-Sub.log"
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -38,87 +31,56 @@ BASE_SUB_PORT = os.getenv("BASE_SUB_PORT", "2096")
 SUFFIX_SUB_URL = os.getenv("SUFFIX_SUB_URL", "sub")
 FULL_SUBSCRIPTION_URL = f"{BASE_SUB_URL}:{BASE_SUB_PORT}/{SUFFIX_SUB_URL}"
 
-GITHUB_WHITELIST_URL = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt"
-LOCAL_WHITELIST_FILE = "whitelist"
-
-
-def load_sni_from_github():
-    """
-    Загружает список SNI с GitHub
-    """
-    try:
-        logger.info(f"Loading SNI from GitHub: {GITHUB_WHITELIST_URL}")
-        response = requests.get(GITHUB_WHITELIST_URL, timeout=10)
-        response.raise_for_status()
-
-        sni_list = []
-        for line in response.text.split('\n'):
-            line = line.strip()
-            if line and not line.startswith('#'):  # Пропускаем пустые строки и комментарии
-                sni_list.append(line)
-
-        if not sni_list:
-            raise ValueError("GitHub whitelist is empty")
-
-        logger.info(f"Loaded {len(sni_list)} SNI domains from GitHub")
-        return sni_list
-
-    except Exception as e:
-        logger.info(f"Error loading from GitHub: {e}")
-        # Пробуем загрузить из локального файла как fallback
-        return load_sni_from_local()
-
-
-def load_sni_from_local():
-    """
-    Загружает список SNI из локального файла (fallback)
-    """
-    try:
-        if not os.path.exists(LOCAL_WHITELIST_FILE):
-            raise FileNotFoundError(f"Local whitelist file '{LOCAL_WHITELIST_FILE}' not found")
-
-        with open(LOCAL_WHITELIST_FILE, 'r', encoding='utf-8') as f:
-            sni_list = []
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    sni_list.append(line)
-
-            if not sni_list:
-                raise ValueError("Local whitelist file is empty")
-
-            logger.info(f"Loaded {len(sni_list)} SNI domains from local file")
-            return sni_list
-
-    except Exception as e:
-        logger.info(f"Error loading local whitelist: {e}")
-        raise
-
 
 async def load_sni_from_db(id_sub: str):
     """
-    Загружает список SNI из базы данных
+    Загружает список SNI из базы данных для разных типов конфигураций
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT stream_settings FROM inbounds WHERE settings LIKE ?", (f"%{id_sub}%",))
             rows = await cursor.fetchone()
-            logger.info(f"Loaded {rows} Settings domains from DB")
+
             if not rows:
                 logger.error("No settings found in database for the given criteria")
                 raise ValueError("No settings found in database")
 
-            reality_settings = json.loads(rows[0])
-            logger.info("Loaded Settings from database: %s", reality_settings)
-            # Получаем serverNames
-            sni_list = reality_settings.get('realitySettings', {}).get('serverNames', [])
+            stream_settings = json.loads(rows[0])
+            logger.info("Loaded stream_settings from database")
 
-        logger.info("Loaded SNI from database: %s", sni_list)
-        if not sni_list:
-            raise ValueError("Database whitelist is empty")
+            security_type = stream_settings.get('security', '')
+            network_type = stream_settings.get('network', '')
 
-        logger.info(f"Loaded {len(sni_list)} SNI domains from database")
-        return sni_list
+            logger.info(f"Security type: {security_type}, Network type: {network_type}")
+
+            sni_list = []
+
+            # Для Reality конфигураций
+            if security_type == 'reality':
+                reality_settings = stream_settings.get('realitySettings', {})
+                sni_list = reality_settings.get('serverNames', [])
+                logger.info(f"Loaded {len(sni_list)} SNI domains from Reality settings")
+
+            # Для TLS конфигураций (WebSocket)
+            elif security_type == 'tls' and network_type == 'ws':
+                tls_settings = stream_settings.get('tlsSettings', {})
+                server_name = tls_settings.get('serverName', '')
+
+                # Разделяем домены, если они указаны через запятую
+                if server_name:
+                    sni_list = [domain.strip() for domain in server_name.split(',') if domain.strip()]
+                    logger.info(f"Loaded {len(sni_list)} SNI domains from WebSocket TLS settings: {sni_list}")
+                else:
+                    logger.warning("No serverName found in TLS settings for WebSocket")
+
+            else:
+                logger.warning(f"Unsupported configuration type: security={security_type}, network={network_type}")
+                return []
+
+            if not sni_list:
+                raise ValueError("No SNI domains found in database for this configuration")
+
+            return sni_list
 
     except Exception as e:
         logger.info(f"Error loading SNI from database: {e}")
@@ -131,7 +93,6 @@ def parse_vless_url(vless_url):
     """
     try:
         logger.info(f"=== Parsing vless URL ===")
-        logger.info(f"Original URL: {vless_url}")
 
         # Убираем префикс vless://
         if vless_url.startswith('vless://'):
@@ -147,7 +108,6 @@ def parse_vless_url(vless_url):
 
         # Разделяем серверную часть на параметры и комментарий
         if '#' in server_part:
-            # Разделяем на часть с параметрами и комментарий
             params_part, comment = server_part.split('#', 1)
             comment = unquote(comment)
         else:
@@ -168,11 +128,6 @@ def parse_vless_url(vless_url):
         # Парсим параметры запроса
         params = parse_qs(query_part)
 
-        # Детально логируем все параметры
-        logger.info(f"All parameters found in URL:")
-        for key, values in params.items():
-            logger.info(f"  {key}: {values}")
-
         # Создаем JSON конфиг
         config = {"v": "2", "ps": comment or "base-config", "add": host, "port": port, "id": uuid_part, "aid": "0",
             "scy": "auto", "net": params.get('type', ['tcp'])[0], "type": "none", "host": "",
@@ -180,41 +135,31 @@ def parse_vless_url(vless_url):
             "sni": params.get('sni', [''])[0], "alpn": "", "fp": params.get('fp', ['chrome'])[0],
             "pbk": params.get('pbk', [''])[0], "sid": params.get('sid', [''])[0], "spx": params.get('spx', [''])[0]}
 
-        # Обрабатываем flow
+        # Обрабатываем дополнительные параметры
         if 'flow' in params:
             config['flow'] = params['flow'][0]
-
-        # Обрабатываем encryption
         if 'encryption' in params:
             config['encryption'] = params['encryption'][0]
-
-        # Обрабатываем allowInsecure для WebSocket
         if 'allowInsecure' in params:
             config['allowInsecure'] = params['allowInsecure'][0]
-
-        # Обрабатываем host для WebSocket
         if 'host' in params:
             config['host'] = params['host'][0]
 
-        logger.info(f"Config type detection:")
-        logger.info(f"  Network type (net): {config['net']}")
-        logger.info(f"  Security (tls): {config['tls']}")
-        logger.info(f"  Has flow: {'flow' in config}")
-        logger.info(f"  Has pbk: {bool(config.get('pbk'))}")
+        # ОПРЕДЕЛЕНИЕ ТИПА КОНФИГА - УПРОЩЕННАЯ ЛОГИКА
+        config_type = 'other'
 
-        # Определяем тип конфига
-        if config['net'] == 'ws' and config['tls'] == 'tls':
-            config['_config_type'] = 'websocket'
-            logger.info(f"  Detected: WebSocket config")
+        # WebSocket detection
+        if config['net'] == 'ws':
+            config_type = 'websocket'
+        # Reality detection
         elif config['tls'] == 'reality' and config.get('pbk'):
-            config['_config_type'] = 'reality'
-            logger.info(f"  Detected: Reality config")
-        else:
-            config['_config_type'] = 'other'
-            logger.info(f"  Detected: Other config type")
+            config_type = 'reality'
 
-        logger.info(f"Final config keys: {list(config.keys())}")
-        logger.info(f"Comment (ps): '{comment}'")
+        config['_config_type'] = config_type
+
+        logger.info(f"Config type: {config_type}")
+        logger.info(f"Network: {config['net']}, Security: {config['tls']}")
+        logger.info(f"SNI: {config['sni']}")
         logger.info(f"=== End parsing ===\n")
 
         return config
@@ -233,7 +178,6 @@ def json_to_vless_url(config):
     try:
         logger.info(f"=== Converting JSON to vless URL ===")
         logger.info(f"Config type: {config.get('_config_type', 'unknown')}")
-        logger.info(f"Config keys: {list(config.keys())}")
 
         # Базовые параметры
         uuid = config.get('id', '')
@@ -255,9 +199,6 @@ def json_to_vless_url(config):
             value = config.get(param)
             if value:
                 params[param] = value
-                logger.info(f"Added {param}: {value}")
-
-        logger.info(f"Final parameters: {params}")
 
         # Собираем URL
         query_string = urlencode(params, doseq=True)
@@ -267,7 +208,7 @@ def json_to_vless_url(config):
         if comment:
             vless_url += f"#{comment}"
 
-        logger.info(f"Generated URL: {vless_url}")
+        logger.info(f"Generated URL length: {len(vless_url)}")
         logger.info(f"=== End conversion ===\n")
 
         return vless_url
@@ -294,7 +235,7 @@ def get_base_configs(sub_id: str):
         # Декодируем base64
         try:
             decoded_content = base64.b64decode(original_content).decode('utf-8')
-            logger.info(f"Decoded subscription: {decoded_content}")
+            logger.info(f"First 200 chars of decoded: {decoded_content[:200]}")
 
             configs = [line.strip() for line in decoded_content.split('\n') if line.strip()]
             logger.info(f"Found {len(configs)} config lines in subscription")
@@ -302,21 +243,16 @@ def get_base_configs(sub_id: str):
             # Парсим каждую конфигурацию
             valid_configs = []
             for config_line in configs:
-                # Если это vless:// ссылка
                 if config_line.startswith('vless://'):
                     config = parse_vless_url(config_line)
                     if config:
                         valid_configs.append(config)
-                        logger.info(f"Successfully parsed vless config: {config.get('_config_type')}")
-                # Если это JSON
+                        logger.info(f"Parsed config type: {config.get('_config_type')}")
                 else:
                     try:
                         config = json.loads(config_line)
                         valid_configs.append(config)
-                        logger.info(f"Valid JSON config: {config.get('ps', 'Unknown')}")
                     except json.JSONDecodeError:
-                        logger.info(f"Invalid JSON, trying as vless URL: {config_line[:50]}...")
-                        # Пробуем распарсить как vless
                         config = parse_vless_url(config_line)
                         if config:
                             valid_configs.append(config)
@@ -343,37 +279,35 @@ def generate_multi_configs(base_configs, sni_list):
 
     for base_config in base_configs:
         config_type = base_config.get('_config_type', 'unknown')
-        logger.info(f"Processing config type: {config_type}")
+        current_sni = base_config.get('sni', '')
+
+        logger.info(f"Processing config type: {config_type}, current SNI: {current_sni}")
 
         if config_type == 'reality':
             # Для Reality: создаем конфиг для каждого SNI
             for sni in sni_list:
                 new_config = base_config.copy()
                 new_config['sni'] = sni
+                new_config['ps'] = f"{base_config.get('ps', 'base-config')} - sni:{sni}"
 
-                # Обновляем описание
-                original_ps = base_config.get('ps', 'base-config')
-                new_config['ps'] = f"{original_ps} - sni:{sni}"
-
-                # Конвертируем обратно в vless URL
                 vless_url = json_to_vless_url(new_config)
                 if vless_url:
                     multi_configs.append(vless_url)
 
         elif config_type == 'websocket':
-            # Для WebSocket: создаем конфиг для каждого SNI
+            # ДЛЯ WEBSOCKET: ВСЕГДА создаем конфиги для каждого SNI из списка
+            # независимо от того, есть ли уже SNI в базовом конфиге
+            logger.info(f"WebSocket config - generating configs for {len(sni_list)} SNIs")
+
             for sni in sni_list:
                 new_config = base_config.copy()
                 new_config['sni'] = sni
+                new_config['ps'] = f"{base_config.get('ps', 'base-config')} - sni:{sni}"
 
-                # Обновляем описание
-                original_ps = base_config.get('ps', 'base-config')
-                new_config['ps'] = f"{original_ps} - sni:{sni}"
-
-                # Конвертируем обратно в vless URL
                 vless_url = json_to_vless_url(new_config)
                 if vless_url:
                     multi_configs.append(vless_url)
+                    logger.info(f"Added WebSocket config with SNI: {sni}")
 
         else:
             # Для других типов конфигов просто добавляем как есть
@@ -381,26 +315,31 @@ def generate_multi_configs(base_configs, sni_list):
             if vless_url:
                 multi_configs.append(vless_url)
 
+    logger.info(f"Total generated configs: {len(multi_configs)}")
     return multi_configs
 
 
 @app.get("/sub/{id_sub}", response_class=PlainTextResponse)
-async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здесь указывается Subscribe ID из x-ui")]):
+async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Subscribe ID")]):
     """
     Генерирует подписку с несколькими SNI на основе базовой подписки
     """
     try:
-        # Загружаем SNI с GitHub или из базы данных
-        # sni_list = load_sni_from_github()
+        # Загружаем SNI из базы данных
         sni_list = await load_sni_from_db(id_sub)
-        logger.info(f"Processing {len(sni_list)} SNI domains")
+        logger.info(f"Loaded {len(sni_list)} SNI domains: {sni_list}")
 
         # Получаем базовые конфиги
         base_configs = get_base_configs(id_sub)
-        logger.info(f"Processing {len(base_configs)} base configs")
+        logger.info(f"Found {len(base_configs)} base configs")
 
         if not base_configs:
             return "Error: No valid configurations found in base subscription"
+
+        # Логируем типы конфигов для отладки
+        for i, config in enumerate(base_configs):
+            logger.info(
+                f"Base config {i}: type={config.get('_config_type')}, net={config.get('net')}, tls={config.get('tls')}, sni={config.get('sni')}")
 
         # Генерируем множественные конфиги
         multi_configs = generate_multi_configs(base_configs, sni_list)
@@ -422,28 +361,31 @@ async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Здес
         return error_msg
 
 
-@app.get("/debug-sni-list")
-async def debug_sni_list():
+@app.get("/debug-configs/{id_sub}")
+async def debug_configs(id_sub: str):
     """
-    Отладочный эндпоинт для проверки SNI списка
+    Отладочный эндпоинт для проверки конфигов
     """
     try:
-        sni_list = load_sni_from_github()
-        return {"status": "success", "sni_count": len(sni_list), "sni_list": sni_list[:10]  # Показываем первые 10 SNI
+        sni_list = await load_sni_from_db(id_sub)
+        base_configs = get_base_configs(id_sub)
+
+        configs_info = []
+        for i, config in enumerate(base_configs):
+            config_info = {"index": i, "type": config.get('_config_type', 'unknown'), "ps": config.get('ps', 'unknown'),
+                "net": config.get('net', 'unknown'), "tls": config.get('tls', 'unknown'),
+                "sni": config.get('sni', 'not_set'), "has_pbk": bool(config.get('pbk')),
+                "has_flow": bool(config.get('flow'))}
+            configs_info.append(config_info)
+
+        # Генерируем пример multi-конфигов
+        multi_configs = generate_multi_configs(base_configs, sni_list[:3])  # Берем только 3 для примера
+
+        return {"status": "success", "sni_count": len(sni_list), "sni_list": sni_list,
+            "base_configs_count": len(base_configs), "base_configs": configs_info,
+            "multi_configs_sample": multi_configs[:3] if multi_configs else []  # Показываем первые 3
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/reload-whitelist")
-async def reload_whitelist():
-    """
-    Перезагружает whitelist (для проверки без перезапуска сервера)
-    """
-    try:
-        sni_list = load_sni_from_github()
-        return {"status": "success", "message": f"Whitelist reloaded successfully", "domains_loaded": len(sni_list),
-            "source": "github"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
