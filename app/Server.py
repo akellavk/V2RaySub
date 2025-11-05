@@ -31,6 +31,34 @@ BASE_SUB_PORT = os.getenv("BASE_SUB_PORT", "2096")
 SUFFIX_SUB_URL = os.getenv("SUFFIX_SUB_URL", "sub")
 FULL_SUBSCRIPTION_URL = f"{BASE_SUB_URL}:{BASE_SUB_PORT}/{SUFFIX_SUB_URL}"
 
+GITHUB_WHITELIST_URL = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt"
+LOCAL_WHITELIST_FILE = "whitelist"
+
+
+def load_sni_from_github():
+    """
+    Загружает список SNI с GitHub
+    """
+    try:
+        logger.info(f"Loading SNI from GitHub: {GITHUB_WHITELIST_URL}")
+        response = requests.get(GITHUB_WHITELIST_URL, timeout=10)
+        response.raise_for_status()
+
+        sni_list = []
+        for line in response.text.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):  # Пропускаем пустые строки и комментарии
+                sni_list.append(line)
+
+        if not sni_list:
+            raise ValueError("GitHub whitelist is empty")
+
+        logger.info(f"Loaded {len(sni_list)} SNI domains from GitHub")
+        return sni_list
+
+    except Exception as e:
+        logger.info(f"Error loading from GitHub: {e}")
+        return None
 
 async def load_sni_from_db(id_sub: str):
     """
@@ -327,6 +355,47 @@ async def multi_subscription(id_sub: Annotated[str, PathApi(..., title="Subscrib
     try:
         # Загружаем SNI из базы данных
         sni_list = await load_sni_from_db(id_sub)
+        logger.info(f"Loaded {len(sni_list)} SNI domains: {sni_list}")
+
+        # Получаем базовые конфиги
+        base_configs = get_base_configs(id_sub)
+        logger.info(f"Found {len(base_configs)} base configs")
+
+        if not base_configs:
+            return "Error: No valid configurations found in base subscription"
+
+        # Логируем типы конфигов для отладки
+        for i, config in enumerate(base_configs):
+            logger.info(
+                f"Base config {i}: type={config.get('_config_type')}, net={config.get('net')}, tls={config.get('tls')}, sni={config.get('sni')}")
+
+        # Генерируем множественные конфиги
+        multi_configs = generate_multi_configs(base_configs, sni_list)
+        logger.info(f"Generated {len(multi_configs)} total configs")
+
+        if not multi_configs:
+            return "Error: No configurations generated"
+
+        # Кодируем обратно в base64
+        combined_configs = '\n'.join(multi_configs)
+        encoded_output = base64.b64encode(combined_configs.encode('utf-8')).decode('utf-8')
+
+        logger.info(f"Successfully generated subscription with {len(multi_configs)} configs")
+        return encoded_output
+
+    except Exception as e:
+        error_msg = f"Error processing subscription: {str(e)}"
+        logger.info(error_msg)
+        return error_msg
+
+@app.get("/subf/{id_sub}", response_class=PlainTextResponse)
+async def multi_subscription_all(id_sub: Annotated[str, PathApi(..., title="Subscribe ID")]):
+    """
+    Генерирует подписку со всеми SNI на основе базовой подписки
+    """
+    try:
+        # Загружаем SNI из базы данных
+        sni_list = load_sni_from_github()
         logger.info(f"Loaded {len(sni_list)} SNI domains: {sni_list}")
 
         # Получаем базовые конфиги
